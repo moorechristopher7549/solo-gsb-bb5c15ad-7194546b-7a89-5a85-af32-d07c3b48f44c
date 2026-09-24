@@ -22,7 +22,11 @@
 evenodd / nonzero 填充规则汇总为 inside / outside，开放子路径不参与）、
 **`POST /paths/{id}/hole-clearance` 孔洞最大内接圆钻孔选点**
 （逐有效孔洞在孔内、避开直属岛的可行区域中按距离上界优先细分网格，
-在给定精度内逼近最大内接圆圆心与半径）
+在给定精度内逼近最大内接圆圆心与半径）、
+**`POST /paths/{id}/window-coverage` 矩形窗口覆盖分析**
+（一次提交最多 50 个轴对齐窗口，复用曲线细分轮廓，把每个有效闭合环
+Sutherland–Hodgman 裁剪到窗口后按外环/孔/岛层级交替求面积，
+返回逐窗净填充面积、窗口面积与覆盖率，穿越窗口的轮廓同样计入）
 与 **`POST /paths/compare` 版本差异审计**，
 按几何指纹稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，
 可直接调用。
@@ -44,8 +48,9 @@ evenodd / nonzero 填充规则汇总为 inside / outside，开放子路径不参
 │   ├── intersections.py # 加工前轮廓交叉清单：非相邻边自交/子路径互交、交叉/接触/共线重叠分类合并
 │   ├── hittest.py      # 批量点命中测试：boundary 优先，evenodd 交叉奇偶 / nonzero 有向边绕数
 │   ├── holeclearance.py # 孔洞最大内接圆：距离上界优先网格细分、直属岛避让、预算超限报错
+│   ├── windowcoverage.py # 矩形窗口覆盖：Sutherland–Hodgman 半平面裁剪、外环/孔/岛交替面积
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（290 个）
+├── tests/             # pytest 单元 + API 端到端测试（324 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -739,6 +744,106 @@ curl -s -X POST localhost:8000/paths/1/hole-clearance \
 - 路径不存在返回 `404`；`precision` 缺失/≤0/非有限数、网格预算耗尽未收敛、
   已存路径无法解析（历史脏数据）均返回 `422`。
 
+### `POST /paths/{id}/window-coverage` — 矩形窗口覆盖分析（只读）
+
+对已存路径**即时解析**并完成轮廓包含层级分类（复用与 metrics / clearance /
+scanlines 相同的曲线细分折线，无需事先调用 normalize，**不写数据库**），
+把每个**有效闭合环**（`outer` / `hole`，闭合且非退化）用
+**Sutherland–Hodgman** 算法逐半平面裁剪到每个轴对齐矩形窗口内，再对
+裁剪多边形按鞋带公式求面积，并按**包含层级交替**累加：
+
+- 外环 / 岛（深度偶数）与窗口的交集面积 **+** 计入，孔洞（深度奇数）
+  交集面积 **−** 扣减，更深层依次交替；
+- 裁剪前先做**包围盒剔除**：轮廓包围盒与窗口不相交则直接跳过；
+  因此**穿越窗口、但所有顶点均在窗外**的轮廓（边与窗口相交）仍会被
+  裁剪并计入，不会漏算；
+- **开放轮廓**（未以 `Z` 闭合）与**退化轮廓**（面积为 0 或顶点不足）
+  不参与，列入 `skipped_contours`；窗口内没有任何有效填充（窗口完全在
+  图形外、空路径、仅开放/退化轮廓）时净填充面积与覆盖率均为 `0`；
+- 逐窗返回**净填充面积** `filled_area`、**窗口面积** `window_area`
+  与**覆盖率** `coverage = filled_area / window_area`（落在 `[0, 1]`）；
+- 单次最多 **50** 个窗口（至少 1 个），窗口坐标必须是有限数且
+  **宽高为正**（`xmax > xmin`、`ymax > ymin`），否则返回 `422`。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `windows` | `{xmin,ymin,xmax,ymax}[]` | 轴对齐矩形窗口列表，**1 ~ 50** 个；坐标有限、宽高为正 |
+
+```bash
+# 先写入：外方 0..10 含内孔 2..8（净填充 64）
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h10v10h-10Z M2,2h6v6h-6Z"
+}'
+# 三个窗口：全覆盖 / 与外方和孔都部分相交 / 完全在图形外
+curl -s -X POST localhost:8000/paths/1/window-coverage \
+  -H 'Content-Type: application/json' \
+  -d '{"windows": [
+    {"xmin": 0, "ymin": 0, "xmax": 10, "ymax": 10},
+    {"xmin": 5, "ymin": 5, "xmax": 10, "ymax": 10},
+    {"xmin": 20, "ymin": 20, "xmax": 30, "ymax": 30}
+  ]}'
+```
+
+响应（服务地址 <http://localhost:8000>）：
+
+```json
+{
+  "id": 1,
+  "fill_rule": "nonzero",
+  "window_count": 3,
+  "windows": [
+    {"index": 0,
+     "window": {"xmin": 0.0, "ymin": 0.0, "xmax": 10.0, "ymax": 10.0},
+     "window_area": 100.0,
+     "filled_area": 64.0,
+     "coverage": 0.64,
+     "contributing_contour_count": 2},
+    {"index": 1,
+     "window": {"xmin": 5.0, "ymin": 5.0, "xmax": 10.0, "ymax": 10.0},
+     "window_area": 25.0,
+     "filled_area": 16.0,
+     "coverage": 0.64,
+     "contributing_contour_count": 2},
+    {"index": 2,
+     "window": {"xmin": 20.0, "ymin": 20.0, "xmax": 30.0, "ymax": 30.0},
+     "window_area": 100.0,
+     "filled_area": 0.0,
+     "coverage": 0.0,
+     "contributing_contour_count": 0}
+  ],
+  "skipped_contours": []
+}
+```
+
+第二个窗口中：外环交集为 `5×5=25`、内孔（2..8）交集为 `3×3=9`，
+净填充 `25 − 9 = 16`，覆盖率 `16/25 = 0.64`。穿越窗口但顶点均在
+窗外的示例（菱形顶点 `(±1.5,0)/(0,±1.5)` 全在窗口 `[-1,1]²` 外，
+四条斜边穿越窗口，窗口内交集为窗口去掉四个角三角形：
+`4 − 4×0.125 = 3.5`）：
+
+```bash
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M-1.5,0 L0,-1.5 L1.5,0 L0,1.5 Z"
+}'
+curl -s -X POST localhost:8000/paths/2/window-coverage \
+  -H 'Content-Type: application/json' \
+  -d '{"windows": [{"xmin": -1, "ymin": -1, "xmax": 1, "ymax": 1}]}'
+# -> filled_area=3.5, window_area=4.0, coverage=0.875
+```
+
+- `windows[]`：与输入等长、同序，每项含 `index`（从 0 开始）、回显
+  `window`、`window_area`、`filled_area`（外环/岛为正、孔洞扣减后的
+  净交集面积）、`coverage` 与实际有面积贡献的
+  `contributing_contour_count`（仅与窗口相切的轮廓不计入）；
+- 计算基于曲线（贝塞尔/椭圆弧）**细分后的多边形**，与
+  metrics / normalize 使用同一份细分折线；
+- `skipped_contours[]`：未参与的轮廓及 `reason`（`open` / `degenerate`）；
+- 路径不存在返回 `404`；窗口列表缺失/为空/超过 50 个、坐标缺失/非数字/
+  非有限数（NaN/Infinity/1e999）、宽高为零或负均返回 `422`；
+  已存路径无法解析（历史脏数据）返回 `422`。
+
 ### `GET /paths/{id}` — 查询原始路径、规范化结果与警告
 
 未规范化时 `normalized` 为 `null`；已规范化时包含 `d`、`contours`、
@@ -884,7 +989,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 290 passed
+pytest -q          # 324 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -934,7 +1039,15 @@ apothem、偏心岛把圆心推离且半径等于到孔/岛边界最短距离（
 孔中岛与岛中孔各自求解、同级双孔按原始索引升序、无有效孔洞返回空数组、
 开放与退化子路径跳过、两种填充规则一致、跨调用确定性、非法 precision
 422、细长孔极小精度触发 20000 网格预算 422、只读不落库、404/非法 id/
-脏数据 422 等。
+脏数据 422 等；
+矩形窗口覆盖分析的窗口全在轮廓内/部分相交/完全在外/覆盖整个轮廓/
+与包围盒等大、外环-孔/外-孔-岛/四层交替在窗口内交替扣减、孔被窗口
+部分裁剪、顶点全在窗外但边穿越窗口计入（菱形 3.5）、轮廓完全包住窗口、
+凹多边形裁剪桥接边抵消、仅边/点相切零面积、圆等曲线细分裁剪、开放与
+退化轮廓跳过、空路径与仅开放路径零填充、多窗口独立按序返回、
+两种填充规则一致、跨调用确定性、只读不落库、恰好 50 窗放行/51 拒绝、
+空列表/缺字段/零宽高/负宽高/非数字/NaN/Infinity/1e999 返回 422、
+404/非法 id/脏数据 422 等。
 
 ## 数据存储
 
