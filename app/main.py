@@ -11,6 +11,7 @@
     POST /paths/{id}/intersections 只读：加工前轮廓交叉清单（自交/互交/接触/共线重叠）
     POST /paths/{id}/hit-test    只读：批量点命中测试（inside/outside/boundary）
     POST /paths/{id}/hole-clearance 只读：逐孔洞最大内接圆圆心（钻孔选点）
+    POST /paths/{id}/window-coverage 只读：矩形窗口覆盖分析（逐窗净填充面积与覆盖率）
     POST /paths/compare          两条已存路径的版本差异审计（指纹匹配 + 三类变更）
     GET  /paths/{id}             查询原始路径、规范化结果及边界警告
     GET  /healthz                存活/就绪探针
@@ -26,7 +27,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlite3 import Connection
 
 from . import db
@@ -40,6 +41,7 @@ from .metrics import compute_metrics
 from .scanlines import MAX_SCANLINES, compute_scanlines
 from .svggeo import SVGPathError, analyze_contours, normalize_path
 from .tabs import MAX_TABS, compute_tabs
+from .windowcov import MAX_WINDOWS, compute_window_coverage
 
 
 @asynccontextmanager
@@ -50,11 +52,11 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SVG 轮廓规范化 API",
-    version="1.9.0",
+    version="1.10.0",
     description="写入 SVG path，按包含层级分类外环/孔洞并重写绕向，"
                 "支持填充面积与面积质心分析、水平扫描线填充区间、"
                 "轮廓间安全间隙校验、闭合轮廓加工计划、外环微桥布置、"
-                "孔洞最大内接圆钻孔选点"
+                "孔洞最大内接圆钻孔选点、矩形窗口覆盖分析"
                 "与两条已存路径的版本差异审计。",
     lifespan=lifespan,
 )
@@ -202,6 +204,37 @@ class HoleClearanceIn(BaseModel):
         if not math.isfinite(v):
             raise ValueError("precision 必须是有限数值")
         return v
+
+
+class WindowIn(BaseModel):
+    xmin: float = Field(..., description="窗口左边界 x（必须为有限数值）")
+    ymin: float = Field(..., description="窗口上边界 y（必须为有限数值）")
+    xmax: float = Field(..., description="窗口右边界 x（必须为有限数值）")
+    ymax: float = Field(..., description="窗口下边界 y（必须为有限数值）")
+
+    @field_validator("xmin", "ymin", "xmax", "ymax")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("窗口坐标必须是有限数值")
+        return v
+
+    @model_validator(mode="after")
+    def _positive_extent(self) -> "WindowIn":
+        if not self.xmax > self.xmin:
+            raise ValueError("窗口宽度必须为正（xmax > xmin）")
+        if not self.ymax > self.ymin:
+            raise ValueError("窗口高度必须为正（ymax > ymin）")
+        return self
+
+
+class WindowCoverageIn(BaseModel):
+    windows: list[WindowIn] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_WINDOWS,
+        description=f"轴对齐窗口列表（至少 1 个，最多 {MAX_WINDOWS} 个，"
+                    "按输入顺序返回逐窗结果）")
 
 
 # ---------------------------------------------------------------------------
@@ -504,4 +537,22 @@ def hole_clearance(path_id: int,
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                             detail=str(exc))
+    return {"id": path_id, "fill_rule": row["fill_rule"], **result}
+
+
+@app.post("/paths/{path_id}/window-coverage")
+def window_coverage(path_id: int,
+                    payload: WindowCoverageIn,
+                    conn: Connection = Depends(get_db)) -> dict[str, Any]:
+    row = _get_row(conn, path_id)
+
+    # 即时解析/分类：不依赖已保存的规范化结果，也不写库
+    try:
+        contours, _warnings = _analyze_row(row)
+    except SVGPathError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"SVG path 无法解析: {exc}")
+
+    windows = [(w.xmin, w.ymin, w.xmax, w.ymax) for w in payload.windows]
+    result = compute_window_coverage(contours, windows=windows)
     return {"id": path_id, "fill_rule": row["fill_rule"], **result}

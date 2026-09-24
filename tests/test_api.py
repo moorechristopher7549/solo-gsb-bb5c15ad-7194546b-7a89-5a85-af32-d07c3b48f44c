@@ -1382,3 +1382,177 @@ def test_hole_clearance_422_on_unparseable_stored_path(client):
     assert r.status_code == 422
     assert "无法解析" in r.json()["detail"]
 
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/window-coverage 矩形窗口覆盖分析（只读）
+# ---------------------------------------------------------------------------
+
+def test_window_coverage_basic_outer_hole(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z")
+    r = client.post(f"/paths/{pid}/window-coverage",
+                    json={"windows": [
+                        {"xmin": 0, "ymin": 0, "xmax": 10, "ymax": 10},
+                        {"xmin": 5, "ymin": 5, "xmax": 15, "ymax": 15},
+                        {"xmin": 20, "ymin": 20, "xmax": 30, "ymax": 30}]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["fill_rule"] == "nonzero"
+    assert body["window_count"] == 3
+    assert body["contributing_contour_count"] == 2
+    assert body["skipped_contours"] == []
+    w0, w1, w2 = body["windows"]
+    assert w0["index"] == 0
+    assert w0["window"] == {"xmin": 0.0, "ymin": 0.0,
+                            "xmax": 10.0, "ymax": 10.0}
+    assert w0["window_area"] == 100.0
+    assert w0["covered_area"] == 64.0       # 100 - 36
+    assert w0["coverage"] == 0.64
+    # 5..15 窗口：外环裁剪 25，孔裁剪 5..8 见方 9 -> 16
+    assert w1["covered_area"] == 16.0
+    assert w1["coverage"] == 0.16
+    # 完全窗外：0
+    assert w2["covered_area"] == 0.0
+    assert w2["coverage"] == 0.0
+    assert w2["window_area"] == 100.0
+
+
+def test_window_coverage_contour_enclosing_window_counted(client):
+    # 大环 -10..30 穿越窗口且四个顶点均在窗外：仍计入，覆盖率 1
+    pid = _mk(client, "M-10,-10h40v40h-40Z")
+    body = client.post(f"/paths/{pid}/window-coverage",
+                       json={"windows": [
+                           {"xmin": 0, "ymin": 0,
+                            "xmax": 10, "ymax": 10}]}).json()
+    w = body["windows"][0]
+    assert w["covered_area"] == 100.0
+    assert w["coverage"] == 1.0
+
+
+def test_window_coverage_island_readded(client):
+    # 外 100 - 孔 64 + 岛 4 = 40
+    pid = _mk(client, "M0,0h10v10h-10Z M1,1h8v8h-8Z M6,6h2v2h-2Z")
+    body = client.post(f"/paths/{pid}/window-coverage",
+                       json={"windows": [
+                           {"xmin": 0, "ymin": 0,
+                            "xmax": 10, "ymax": 10}]}).json()
+    assert body["windows"][0]["covered_area"] == 40.0
+    assert body["contributing_contour_count"] == 3
+
+
+def test_window_coverage_skips_open_and_degenerate(client):
+    d = "M0,0h10v10h-10Z M5,5 L8,5 L5,5 Z M20,0 L30,0 L30,10"
+    pid = _mk(client, d)
+    body = client.post(f"/paths/{pid}/window-coverage",
+                       json={"windows": [
+                           {"xmin": 0, "ymin": 0,
+                            "xmax": 10, "ymax": 10}]}).json()
+    assert body["windows"][0]["covered_area"] == 100.0
+    reasons = {(s["original_index"], s["reason"])
+               for s in body["skipped_contours"]}
+    assert reasons == {(1, "degenerate"), (2, "open")}
+
+
+def test_window_coverage_empty_path_zero(client):
+    pid = _mk(client, "")
+    body = client.post(f"/paths/{pid}/window-coverage",
+                       json={"windows": [
+                           {"xmin": 0, "ymin": 0,
+                            "xmax": 10, "ymax": 10}]}).json()
+    w = body["windows"][0]
+    assert w["covered_area"] == 0.0
+    assert w["coverage"] == 0.0
+    assert w["window_area"] == 100.0
+    assert body["contributing_contour_count"] == 0
+
+
+def test_window_coverage_is_readonly_and_needs_no_prior_normalization(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z")
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    payload = {"windows": [{"xmin": 0, "ymin": 0, "xmax": 10, "ymax": 10}]}
+    assert client.post(f"/paths/{pid}/window-coverage",
+                       json=payload).status_code == 200
+    # 即时计算不写库，重复调用一致
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    b1 = client.post(f"/paths/{pid}/window-coverage", json=payload).json()
+    b2 = client.post(f"/paths/{pid}/window-coverage", json=payload).json()
+    assert b1 == b2
+
+
+def test_window_coverage_404(client):
+    r = client.post("/paths/999999/window-coverage",
+                    json={"windows": [
+                        {"xmin": 0, "ymin": 0, "xmax": 1, "ymax": 1}]})
+    assert r.status_code == 404
+
+
+def test_window_coverage_id_path_validation(client):
+    payload = {"windows": [{"xmin": 0, "ymin": 0, "xmax": 1, "ymax": 1}]}
+    assert client.post("/paths/x/window-coverage",
+                       json=payload).status_code == 422
+    assert client.post("/paths/0/window-coverage",
+                       json=payload).status_code == 404
+
+
+def test_window_coverage_422_on_invalid_windows(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    url = f"/paths/{pid}/window-coverage"
+    # 缺 windows / 空列表
+    assert client.post(url, json={}).status_code == 422
+    assert client.post(url, json={"windows": []}).status_code == 422
+    # 窗口缺字段 / 类型错误
+    assert client.post(url, json={"windows": [
+        {"xmin": 0, "ymin": 0, "xmax": 1}]}).status_code == 422
+    assert client.post(url, json={"windows": [
+        {"xmin": "a", "ymin": 0, "xmax": 1, "ymax": 1}]}).status_code == 422
+    # 宽或高非正
+    assert client.post(url, json={"windows": [
+        {"xmin": 1, "ymin": 0, "xmax": 1, "ymax": 1}]}).status_code == 422
+    assert client.post(url, json={"windows": [
+        {"xmin": 2, "ymin": 0, "xmax": 1, "ymax": 1}]}).status_code == 422
+    assert client.post(url, json={"windows": [
+        {"xmin": 0, "ymin": 1, "xmax": 1, "ymax": 1}]}).status_code == 422
+    assert client.post(url, json={"windows": [
+        {"xmin": 0, "ymin": 2, "xmax": 1, "ymax": 1}]}).status_code == 422
+    # 非有限坐标（NaN / Infinity / 超大数）均须 422 而不是 500
+    assert client.post(url, json={"windows": [
+        {"xmin": 0, "ymin": 0, "xmax": "nan", "ymax": 1}]}).status_code == 422
+    r = client.post(url,
+                    content='{"windows":[{"xmin":0,"ymin":0,'
+                            '"xmax":1e999,"ymax":1}]}',
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+    r = client.post(url,
+                    content='{"windows":[{"xmin":0,"ymin":-1e999,'
+                            '"xmax":1,"ymax":1}]}',
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+
+
+def test_window_coverage_422_when_over_50_windows(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    url = f"/paths/{pid}/window-coverage"
+    win = {"xmin": 0, "ymin": 0, "xmax": 10, "ymax": 10}
+    # 恰好 50 个放行
+    r = client.post(url, json={"windows": [win] * 50})
+    assert r.status_code == 200
+    assert r.json()["window_count"] == 50
+    # 51 个拒绝
+    r = client.post(url, json={"windows": [win] * 51})
+    assert r.status_code == 422
+
+
+def test_window_coverage_422_on_unparseable_stored_path(client):
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/window-coverage",
+                    json={"windows": [
+                        {"xmin": 0, "ymin": 0, "xmax": 1, "ymax": 1}]})
+    assert r.status_code == 422
+    assert "无法解析" in r.json()["detail"]
+
